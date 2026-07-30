@@ -1,0 +1,38 @@
+# Havc-Agent 集群启停（对齐 BrainCloud cloud.agents.*）
+# enabled: 是否参与编排；priority: 越大越优先
+
+agents:
+  interaction:
+    enabled: true
+    priority: 110
+    name: 交互快路径
+    role: ui
+    description: 手动/按键修正不经 LLM，直接落设定并写记忆
+
+  comfort:
+    enabled: true
+    priority: 100
+    name: 舒适 Agent
+    role: per_seat
+    description: ISO 7730 多温区热舒适推理 + 记忆逼近
+
+  defog:
+    enabled: true
+    priority: 95
+    name: 除雾 Agent
+    role: cabin
+    description: 玻璃温度/露点/雨量判定，安全优先叠加除霜
+
+  energy:
+    enabled: true
+    priority: 90
+    name: 能耗 Agent
+    role: cabin
+    description: 低 SOC 软钳制风量与设定温差
+
+  nlu:
+    enabled: true
+    priority: 85
+    name: 语音理解
+    role: per_seat
+    description: 自然语言指令理解（可降级规则引擎）

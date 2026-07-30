@@ -1,0 +1,15 @@
+# Havc-Agent PoC 依赖（Python 3.13 验证）
+
+langgraph>=0.2
+langchain-core>=0.3
+langchain-openai>=0.2
+pydantic>=2.7
+numpy>=1.26
+scikit-learn>=1.5
+chromadb>=1.5
+typer>=0.12
+rich>=13
+streamlit>=1.36
+python-dotenv>=1.0
+pyyaml>=6.0
+pytest>=8.0
