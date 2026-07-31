@@ -8,7 +8,16 @@ textColor = "#1A202C"
 font = "sans serif"
 
 [server]
-headless = true
+port = 8888
+# 注意拼写是 address（写成 adress 不生效）
+address = "0.0.0.0"
+# headless=true 时 Streamlit 会请求公网 IP 并打印 External URL（常是无关网关，易误导）
+# 设为 false：只显示 Local / Network，不再显示 External URL
+headless = false
 
 [browser]
 gatherUsageStats = false
+
+[client]
+# 精简顶栏，隐藏 Deploy 等云部署入口（本地演示用）
+toolbarMode = "minimal"
