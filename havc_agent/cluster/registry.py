@@ -61,15 +61,15 @@ class ClusterRegistry:
 
 _DEFAULT_SPECS = [
     AgentSpec("comfort", "舒适 Agent", 100, True, "per_seat",
-              "ISO 7730 多温区热舒适推理 + 记忆逼近"),
+              "ISO 7730 多温区热舒适推理（PMV/PPD）"),
     AgentSpec("defog", "除雾 Agent", 95, True, "cabin",
               "玻璃温度/露点/雨量判定，安全优先叠加除霜"),
     AgentSpec("energy", "能耗 Agent", 90, True, "cabin",
               "低 SOC 软钳制风量与设定温差"),
-    AgentSpec("interaction", "交互快路径", 110, True, "ui",
-              "手动/按键修正不经 LLM，直接落设定并写记忆"),
-    AgentSpec("nlu", "语音理解", 85, True, "per_seat",
-              "自然语言指令理解（可降级规则引擎）"),
+    AgentSpec("interaction", "交互快路径", 110, False, "ui",
+              "（产品版停用）手调/记忆写入"),
+    AgentSpec("nlu", "语音理解", 85, False, "per_seat",
+              "（产品版停用）自然语言指令"),
 ]
 
 

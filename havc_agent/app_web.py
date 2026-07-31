@@ -11,7 +11,8 @@ import streamlit as st
 
 from havc_agent.engine import Engine
 from havc_agent.llm.provider import ping_llm, provider_status
-from havc_agent.schemas import CabinContext, OccupantState, SceneInput, ZoneSetting
+from havc_agent.schemas import CabinContext, OccupantState, SceneInput
+from havc_agent.sim import ClosedLoopSim
 
 _GENDERS = ["male", "female"]
 _EMOTIONS = ["neutral", "happy", "angry", "sad", "joy", "worried"]
@@ -23,10 +24,6 @@ _WEATHER = ["sunny", "cloudy", "rain", "snow"]
 _RAIN = ["none", "light", "moderate", "heavy"]
 _RAIN_ZH = {"none": "无雨", "light": "小雨", "moderate": "中雨", "heavy": "大雨"}
 _DEFOG_ZH = {"none": "无需除雾", "mild": "轻度除雾", "strong": "强除雾"}
-_AIR_MODES = [
-    "face", "face_feet", "feet", "face_defrost",
-    "face_feet_defrost", "feet_defrost", "defrost",
-]
 _SEAT_ZH = {
     "driver": "主驾", "front_passenger": "副驾",
     "rear_left": "左后", "rear_right": "右后",
@@ -141,7 +138,7 @@ def _sidebar_ops(eng: Engine) -> None:
         f"**Model** `{s['model']}`  \n"
         f"**状态** {s['mode']}"
     )
-    if st.sidebar.button("测试 LLM 连接", use_container_width=True):
+    if st.sidebar.button("测试 LLM 连接", width="stretch"):
         ok, msg = ping_llm()
         (st.sidebar.success if ok else st.sidebar.error)(msg)
     st.sidebar.caption("密钥配置见项目根目录 `.env`，修改后需重启。")
@@ -219,6 +216,17 @@ def _build_scene() -> SceneInput:
     )
 
 
+def _rebuild_scene(cabin_obj, occupants, cabin_update: dict | None = None) -> SceneInput:
+    """用 dict 重建 SceneInput，避免 Streamlit 热重载后「旧 CabinContext 类 ≠ 新类」。"""
+    data = cabin_obj.model_dump() if hasattr(cabin_obj, "model_dump") else dict(cabin_obj)
+    if cabin_update:
+        data.update(cabin_update)
+    return SceneInput(
+        cabin=CabinContext.model_validate(data),
+        occupants=list(occupants),
+    )
+
+
 def _status_banners(scene: SceneInput, eng: Engine, result) -> None:
     d = eng.defog_for(scene.cabin) if eng.cluster.is_enabled("defog") else None
     if d is not None:
@@ -242,11 +250,11 @@ def _status_banners(scene: SceneInput, eng: Engine, result) -> None:
     if pending:
         c1, c2, c3 = st.columns([4, 1, 1])
         c1.warning(f"待确认 · {pending.reason} · ticket `{pending.ticket_id}`")
-        if c2.button("确认下发", use_container_width=True):
+        if c2.button("确认下发", width="stretch"):
             fb = eng.confirm_pending("confirm")
             st.success(fb.message if fb else "已确认")
             st.rerun()
-        if c3.button("拒绝", use_container_width=True):
+        if c3.button("拒绝", width="stretch"):
             fb = eng.confirm_pending("reject")
             st.info(fb.message if fb else "已拒绝")
             st.rerun()
@@ -256,37 +264,6 @@ def _status_banners(scene: SceneInput, eng: Engine, result) -> None:
         st.caption(f"回执：{fb.message}")
 
 
-def _send_command(seat: str, scene: SceneInput) -> None:
-    eng = _engine()
-    text = (st.session_state.get(f"cmd_{seat}") or "").strip()
-    if not text:
-        return
-    corrected = eng.apply_command(scene, seat, text)
-    st.session_state[f"cmd_{seat}"] = ""
-    st.toast(
-        f"{_SEAT_ZH[seat]}「{text}」→ {corrected.temp_set}℃ / "
-        f"{corrected.fan_level}档 / {_MODE_ZH.get(corrected.air_mode, corrected.air_mode)}"
-    )
-
-
-def _record_override(seat: str, scene: SceneInput, recommended) -> None:
-    eng = _engine()
-    corrected = ZoneSetting(
-        seat_id=seat,
-        temp_set=float(st.session_state[f"ct_{seat}"]),
-        fan_level=int(st.session_state[f"cf_{seat}"]),
-        air_mode=st.session_state[f"cm_{seat}"],
-    )
-    if recommended is not None and (
-        abs(corrected.temp_set - recommended.temp_set) < 1e-6
-        and corrected.fan_level == recommended.fan_level
-        and corrected.air_mode == recommended.air_mode
-    ):
-        return
-    eng.apply_correction(scene, seat, recommended, corrected)
-    st.toast(f"{_SEAT_ZH[seat]} 已记忆修正")
-
-
 def _zone_table(result) -> None:
     rows = []
     for seat, s in result.settings.items():
@@ -294,24 +271,117 @@ def _zone_table(result) -> None:
         m = t.comfort_metrics if t else None
         rows.append({
             "座位": _SEAT_ZH.get(seat, seat),
-            "温度℃": s.temp_set,
+            "设定℃": s.temp_set,
             "风量": s.fan_level,
             "出风": _MODE_ZH.get(s.air_mode, s.air_mode),
             "PMV": m.pmv if m else "-",
             "PPD%": m.ppd if m else "-",
+            "目标℃": m.target_temp if m else "-",
             "来源": t.source if t else "-",
             "应用": "是" if result.applied.get(seat) else "维持",
         })
     if rows:
-        st.dataframe(rows, use_container_width=True, hide_index=True)
+        st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def _sim_panel(sim: ClosedLoopSim | None) -> None:
+    """闭环热仿真状态、热流与历史曲线。"""
+    st.markdown('<div class="panel-title">闭环热仿真（舱温动力学）</div>', unsafe_allow_html=True)
+    if sim is None:
+        st.info(
+            "点击侧栏「启动闭环热仿真」：按吸热/放热 + 空调送风每 10s 推进舱温，"
+            "并重新推理设定，直至 |PMV|≤0.5 且 PPD≤10%。"
+        )
+        return
+
+    stt = sim.status()
+    c1, c2, c3, c4, c5 = st.columns(5)
+    c1.metric("仿真时刻", f"{stt['t_s']:.0f} s")
+    c2.metric("舱内温度", f"{stt['cabin_temp']:.1f} ℃")
+    c3.metric("本步 ΔT", f"{(stt['last_dT'] or 0):.2f} ℃")
+    c4.metric("空调热流", f"{(stt['q_hvac_w'] or 0):.0f} W")
+    c5.metric("日照得热", f"{(stt['q_solar_w'] or 0):.0f} W")
+
+    if sim.converged:
+        st.success(
+            f"已收敛：全体乘员 |PMV|≤{sim.pmv_abs_limit} 且 PPD≤{sim.ppd_limit}% "
+            f"（用时 {sim.t_s:.0f}s / {sim.step_i} 步）"
+        )
+    elif sim.running:
+        st.warning("仿真运行中：每 10 秒自动更新舱温与 Agent 设定…")
+    else:
+        st.caption(f"已停止（步数 {sim.step_i}/{sim.max_steps}）。可重新启动。")
+
+    if sim.last_thermal:
+        th = sim.last_thermal.to_dict()
+        st.caption(
+            f"热平衡：Q_amb={th['q_amb_w']}W · Q_solar={th['q_solar_w']}W · "
+            f"Q_vent={th['q_vent_w']}W · Q_hvac={th['q_hvac_w']}W · "
+            f"送风 {th['t_supply']}℃ / {th['mass_flow']}kg/s"
+        )
+
+    if sim.history:
+        chart_rows = []
+        for snap in sim.history:
+            avg_pmv = (
+                sum(snap.pmv.values()) / len(snap.pmv) if snap.pmv else None
+            )
+            chart_rows.append({
+                "t_s": snap.t_s,
+                "舱温℃": snap.cabin_temp,
+                "平均PMV": None if avg_pmv is None else round(avg_pmv, 2),
+            })
+        st.line_chart(chart_rows, x="t_s", y=["舱温℃", "平均PMV"])
+
+
+def _sim_do_tick() -> bool:
+    """推进一帧热仿真；成功返回 True。"""
+    sim = st.session_state.get("sim")
+    if sim is None or not sim.running:
+        return False
+    with st.spinner(f"仿真步进中 t={sim.t_s:.0f}s → {sim.t_s + sim.dt_s:.0f}s…"):
+        result = sim.tick()
+    st.session_state.result = result
+    st.session_state.sim = sim
+    st.session_state["_sim_last_tick_ts"] = time.time()
+    return True
+
+
+@st.fragment(run_every=10)
+def _sim_auto_tick() -> None:
+    """每 10 秒自动推进一帧（fragment 时钟）。
+
+    注意：启动时只做了 t=0 推理，舱温要等 tick 才会下降。
+    st.rerun() 后 fragment 会立刻重挂载，用时间戳避免连跳。
+    """
+    sim = st.session_state.get("sim")
+    if sim is None or not sim.running:
+        return
+    cab = sim.scene.cabin.cabin_temp
+    now = time.time()
+    last = float(st.session_state.get("_sim_last_tick_ts", 0.0))
+    remain = max(0, int(10 - (now - last)))
+    st.caption(
+        f"⏱ 仿真运行中 · t={sim.t_s:.0f}s · 舱温 {cab}℃ · "
+        f"{'步进中…' if remain <= 0 else f'{remain}s 后下一步'}"
+    )
+    if now - last < 9.5:
+        return
+    if _sim_do_tick():
+        st.rerun()
 
 
 def _dashboard(scene: SceneInput, eng: Engine, result) -> None:
+    sim = st.session_state.get("sim")
+    _sim_panel(sim)
     _status_banners(scene, eng, result)
     st.markdown('<div class="panel-title">多温区设定总览</div>', unsafe_allow_html=True)
     _zone_table(result)
 
-    st.markdown('<div class="panel-title">分区操作</div>', unsafe_allow_html=True)
+    st.markdown('<div class="panel-title">分区状态（只读 · Agent 闭环输出）</div>', unsafe_allow_html=True)
+    if not result.settings:
+        st.warning("暂无温区设定，请先推理或启动仿真。")
+        return
     cols = st.columns(min(2, max(1, len(result.settings))))
     for i, (seat, s) in enumerate(result.settings.items()):
         t = result.traces[seat]
@@ -322,41 +392,20 @@ def _dashboard(scene: SceneInput, eng: Engine, result) -> None:
                 if occ:
                     title += f" · {_CAT_ZH[occ.category]}/{occ.age}岁"
                 st.markdown(title)
-                st.text_input(
-                    "自然语言指令",
-                    key=f"cmd_{seat}",
-                    placeholder="例：太冷了 / 调到 22 度 / 吹脚",
-                    on_change=_send_command, args=(seat, scene),
-                )
                 m1, m2, m3 = st.columns(3)
-                m1.metric("温度", f"{s.temp_set}℃")
+                m1.metric("设定温度", f"{s.temp_set}℃")
                 m2.metric("风量", f"{s.fan_level}/7")
                 m3.metric("出风", _MODE_ZH.get(s.air_mode, s.air_mode))
+                if t.comfort_metrics:
+                    m = t.comfort_metrics
+                    st.caption(
+                        f"舱温感≈{m.cabin_temp}℃ · PMV {m.pmv} · PPD {m.ppd}% · "
+                        f"舒适锚点 {m.target_temp}℃"
+                    )
                 if t.knowledge_snippets:
                     st.caption("知识：" + " | ".join(t.knowledge_snippets[:2]))
                 for adj in t.safety_adjustments[:3]:
                     st.caption("护栏：" + adj)
-                st.session_state[f"ct_{seat}"] = float(s.temp_set)
-                st.session_state[f"cf_{seat}"] = int(s.fan_level)
-                st.session_state[f"cm_{seat}"] = s.air_mode
-                args = (seat, scene, t.final)
-                a1, a2 = st.columns(2)
-                with a1:
-                    st.number_input(
-                        "手动温度", 15.5, 31.5, step=0.5, key=f"ct_{seat}",
-                        on_change=_record_override, args=args,
-                    )
-                with a2:
-                    st.slider(
-                        "手动风量", 1, 7, key=f"cf_{seat}",
-                        on_change=_record_override, args=args,
-                    )
-                st.selectbox(
-                    "手动出风", _AIR_MODES, key=f"cm_{seat}",
-                    on_change=_record_override, args=args,
-                )
-
-    st.metric("会话修正率（越低越好）", f"{eng.metrics.correction_rate:.2f}")
 
 
 def _chain_panel(scene: SceneInput, eng: Engine, result) -> None:
@@ -382,26 +431,9 @@ def _chain_panel(scene: SceneInput, eng: Engine, result) -> None:
                 )
 
 
-def _memory_panel(eng: Engine) -> None:
-    st.markdown('<div class="panel-title">学习记忆</div>', unsafe_allow_html=True)
-    summary = eng.store.summary()
-    if not summary:
-        st.info("暂无记忆。在总览中手动调节或输入自然语言指令后生成。")
-        return
-    for (user, seat), cnt in sorted(summary.items()):
-        c1, c2 = st.columns([5, 1])
-        c1.markdown(f"**{user}** × {_SEAT_ZH.get(seat, seat)} · {cnt} 条")
-        if c2.button("删除", key=f"del{user}{seat}", use_container_width=True):
-            eng.store.delete(user, seat)
-            st.rerun()
-    if st.button("清空全部记忆", use_container_width=True):
-        eng.store.reset_all()
-        st.rerun()
-
-
 def _cluster_panel(eng: Engine, result) -> None:
     st.markdown('<div class="panel-title">集群与可观测性</div>', unsafe_allow_html=True)
-    st.dataframe(eng.cluster.summary(), use_container_width=True, hide_index=True)
+    st.dataframe(eng.cluster.summary(), width="stretch", hide_index=True)
     st.markdown(
         f"<div class='kv'>车辆 ID：<b>{eng.vehicle_id}</b><br>"
         f"最近请求：<b>{getattr(result, 'request_id', '-')}</b><br>"
@@ -423,28 +455,98 @@ def main() -> None:
     _sidebar_ops(eng)
     scene = _build_scene()
 
-    run = st.sidebar.button("执行推理", type="primary", use_container_width=True)
-    auto = st.sidebar.checkbox("参数变更后自动推理", value=True)
-    if run or auto or "result" not in st.session_state:
+    st.sidebar.markdown("### 闭环热仿真")
+    st.sidebar.caption(
+        "集总热容：环境导热 + 日照得热 + 开窗通风 + 空调送风。"
+        "每 10s 更新舱温并重跑 Agent，直到乘客舒适。"
+    )
+    start_sim = st.sidebar.button("启动闭环热仿真", type="primary", width="stretch")
+    stop_sim = st.sidebar.button("停止仿真", width="stretch")
+    step_once = st.sidebar.button("单步推进 10s", width="stretch")
+
+    if stop_sim and st.session_state.get("sim"):
+        st.session_state.sim.running = False
+
+    if start_sim:
+        sim = ClosedLoopSim(engine=eng, scene=scene, dt_s=10.0, max_steps=60)
+        with st.spinner("初始化闭环仿真（首次推理）…"):
+            result0 = sim.start(initial_infer=True)
+        # 立刻热步进一帧：否则界面会一直停在侧栏内温（如 38℃），像“没反应”
+        if sim.running:
+            with st.spinner("推进热模型 10s…"):
+                result0 = sim.tick()
+        st.session_state.sim = sim
+        st.session_state.result = result0
+        st.session_state["_sim_last_tick_ts"] = time.time()
+
+    if step_once and st.session_state.get("sim"):
+        sim = st.session_state.sim
+        if not sim.running and not sim.converged:
+            sim.running = True
+        if sim.running:
+            _sim_do_tick()
+
+    run = st.sidebar.button("仅执行推理（无热步进）", width="stretch")
+    auto = st.sidebar.checkbox("参数变更后自动推理", value=False)
+
+    sim = st.session_state.get("sim")
+    # 侧栏「车内温度」滑条只作初始条件；仿真启动后以热模型舱温为准，不再被滑条覆盖
+    if sim is not None and (sim.running or sim.history):
+        try:
+            display_scene = _rebuild_scene(
+                sim.scene.cabin,
+                scene.occupants,
+                {
+                    "ambient_temp": scene.cabin.ambient_temp,
+                    "sun_driver_wm2": scene.cabin.sun_driver_wm2,
+                    "sun_passenger_wm2": scene.cabin.sun_passenger_wm2,
+                    "speed": scene.cabin.speed,
+                    "humidity": scene.cabin.humidity,
+                    "soc": scene.cabin.soc,
+                    "weather": scene.cabin.weather,
+                    "season": scene.cabin.season,
+                    "windows_open": scene.cabin.windows_open,
+                    "max_defrost": scene.cabin.max_defrost,
+                    "rain_level": scene.cabin.rain_level,
+                    "windshield_air_temp": scene.cabin.windshield_air_temp,
+                    "windshield_glass_temp": scene.cabin.windshield_glass_temp,
+                },
+            )
+            sim.scene = display_scene
+        except Exception:
+            # 热重载导致 session 里旧 sim 与新类不兼容：清掉，让用户重新启动
+            st.session_state.pop("sim", None)
+            st.session_state.pop("result", None)
+            st.warning("检测到代码热更新，已重置仿真状态，请重新点击「启动闭环热仿真」。")
+            display_scene = scene
+            sim = None
+        if sim is not None:
+            st.sidebar.info(
+                f"仿真舱温 **{display_scene.cabin.cabin_temp}℃** "
+                f"(t={sim.t_s:.0f}s，侧栏内温滑条仅作启动初值)"
+            )
+    else:
+        display_scene = scene
+
+    if run or (auto and "result" not in st.session_state) or "result" not in st.session_state:
         with st.spinner("Agent 集群推理中…"):
             st.session_state.result = eng.infer(
-                scene, capture_chain=True, force=bool(run or "result" not in st.session_state)
+                display_scene, capture_chain=True, force=True
             )
-            st.session_state.scene_snap = scene
 
     result = st.session_state.result
-    _topbar(scene, result)
+    _topbar(display_scene, result)
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["运行总览", "推理链路", "学习记忆", "集群运维"]
-    )
+    # 自动时钟放在侧栏，便于看到「还在跑」
+    with st.sidebar:
+        _sim_auto_tick()
+
+    tab1, tab2, tab3 = st.tabs(["运行总览", "推理链路", "集群运维"])
     with tab1:
-        _dashboard(scene, eng, result)
+        _dashboard(display_scene, eng, result)
     with tab2:
-        _chain_panel(scene, eng, result)
+        _chain_panel(display_scene, eng, result)
     with tab3:
-        _memory_panel(eng)
-    with tab4:
         _cluster_panel(eng, result)
 
 
